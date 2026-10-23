@@ -675,8 +675,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			}
 		case "metadataEvent":
 			// stopReason rides inside metadataEvent on the wire; there is no
-			// standalone stop reason event type. Its absence after content is
-			// how callers detect a truncated stream.
+			// standalone stop reason event type. Some upstream accounts omit
+			// metadataEvent entirely, so callers also accept answer content on
+			// a clean EOF.
 			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
 				callback.OnStopReason(reason)
 			}

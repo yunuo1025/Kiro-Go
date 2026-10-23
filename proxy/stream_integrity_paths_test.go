@@ -42,17 +42,18 @@ func setupIntegrityPathTest(t *testing.T, server *httptest.Server) *Handler {
 	}
 }
 
-// truncatedUpstream serves content long enough to be flushed to the client but
-// never sends a metadataEvent, i.e. a transport-successful truncated stream.
-func truncatedUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
+// reasoningOnlyUpstream ends cleanly after reasoning without an answer. Unlike
+// content-only EOF, this remains an integrity failure. Thinking-enabled Claude
+// and OpenAI streams flush the reasoning, making retries unsafe.
+func reasoningOnlyUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits != nil {
 			hits.Add(1)
 		}
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": strings.Repeat("partial answer ", 8),
+		_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": strings.Repeat("partial reasoning ", 8),
 		}))
 	}))
 }
@@ -61,12 +62,12 @@ func truncatedUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
 // SSE error, never with a forged end_turn that tells the client it is done.
 func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	var hits atomic.Int32
-	server := truncatedUpstream(t, &hits)
+	server := reasoningOnlyUpstream(t, &hits)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
+		"model":"claude-sonnet-4.5-thinking",
 		"max_tokens":100,
 		"messages":[{"role":"user","content":"hello"}],
 		"stream":true
@@ -75,7 +76,7 @@ func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	h.handleClaudeMessages(rec, req)
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "partial answer") {
+	if !strings.Contains(body, "partial reasoning") {
 		t.Fatalf("expected flushed content, got %s", body)
 	}
 	if strings.Contains(body, `"stop_reason":"end_turn"`) {
@@ -98,8 +99,8 @@ func TestClaudeNonStreamRetriesTruncatedStream(t *testing.T) {
 		n := hits.Add(1)
 		w.WriteHeader(http.StatusOK)
 		if n == 1 {
-			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-				"content": "truncated attempt",
+			_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+				"text": "truncated attempt",
 			}))
 			return
 		}
@@ -114,7 +115,7 @@ func TestClaudeNonStreamRetriesTruncatedStream(t *testing.T) {
 	h := setupIntegrityPathTest(t, server)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
+		"model":"claude-sonnet-4.5-thinking",
 		"max_tokens":100,
 		"messages":[{"role":"user","content":"hello"}]
 	}`))
@@ -146,12 +147,12 @@ func TestClaudeNonStreamRetriesTruncatedStream(t *testing.T) {
 // A soft integrity failure means the upstream blipped, not that the credential
 // is bad. The account must stay enabled and unbanned.
 func TestIntegrityFailureDoesNotBanAccount(t *testing.T) {
-	server := truncatedUpstream(t, nil)
+	server := reasoningOnlyUpstream(t, nil)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
+		"model":"claude-sonnet-4.5-thinking",
 		"max_tokens":100,
 		"messages":[{"role":"user","content":"hello"}],
 		"stream":true
@@ -181,12 +182,12 @@ func TestIntegrityFailureDoesNotBanAccount(t *testing.T) {
 // Responses streaming must surface response.failed instead of closing the turn
 // with response.completed when the upstream truncated.
 func TestResponsesStreamEmitsFailedOnTruncatedStream(t *testing.T) {
-	server := truncatedUpstream(t, nil)
+	server := reasoningOnlyUpstream(t, nil)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
+		"model":"claude-sonnet-4.5-thinking",
 		"input":"hello",
 		"stream":true,
 		"store":false
@@ -205,12 +206,12 @@ func TestResponsesStreamEmitsFailedOnTruncatedStream(t *testing.T) {
 
 // OpenAI streaming must not close a truncated turn with a normal finish_reason.
 func TestOpenAIStreamEmitsErrorOnTruncatedStream(t *testing.T) {
-	server := truncatedUpstream(t, nil)
+	server := reasoningOnlyUpstream(t, nil)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
+		"model":"claude-sonnet-4.5-thinking",
 		"messages":[{"role":"user","content":"hello"}],
 		"stream":true
 	}`))
@@ -218,7 +219,7 @@ func TestOpenAIStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	h.handleOpenAIChat(rec, req)
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "partial answer") {
+	if !strings.Contains(body, "partial reasoning") {
 		t.Fatalf("expected flushed content, got %s", body)
 	}
 	if strings.Contains(body, `"finish_reason":"stop"`) {
@@ -232,19 +233,17 @@ func TestOpenAIStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	}
 }
 
-// Regression for a defect the reference implementation does not cover: a short
-// unflushed chunk stays inside processClaudeText's tag buffer, so a retry that
-// does not clear it concatenates the previous attempt's text onto the new one.
-func TestClaudeStreamRetryDoesNotLeakPreviousAttemptText(t *testing.T) {
+// A buffered reasoning-only attempt is retryable. Its reasoning must be reset
+// before recovery, otherwise thinking-enabled responses expose the discarded
+// attempt even though the final answer succeeds.
+func TestClaudeNonStreamRetryDoesNotLeakPreviousAttemptReasoning(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := hits.Add(1)
 		w.WriteHeader(http.StatusOK)
 		if n == 1 {
-			// Short enough to stay in the buffer: never flushed to the client,
-			// so the stream is still retryable.
-			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-				"content": "LEAK",
+			_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+				"text": "LEAK",
 			}))
 			return
 		}
@@ -259,22 +258,168 @@ func TestClaudeStreamRetryDoesNotLeakPreviousAttemptText(t *testing.T) {
 	h := setupIntegrityPathTest(t, server)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
+		"model":"claude-sonnet-4.5-thinking",
 		"max_tokens":100,
-		"messages":[{"role":"user","content":"hello"}],
-		"stream":true
+		"messages":[{"role":"user","content":"hello"}]
 	}`))
 	rec := httptest.NewRecorder()
 	h.handleClaudeMessages(rec, req)
 
 	body := rec.Body.String()
-	if hits.Load() < 2 {
-		t.Fatalf("expected retry for unflushed truncated stream, hits=%d", hits.Load())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected successful recovery, got %d body=%s", rec.Code, body)
+	}
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode recovered answer: %v body=%s", err, body)
+	}
+	if resp.StopReason != "end_turn" {
+		t.Fatalf("expected completed answer, got %+v", resp)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("expected one retry for reasoning-only stream, hits=%d", hits.Load())
 	}
 	if strings.Contains(body, "LEAK") {
 		t.Fatalf("discarded attempt leaked into the retry output: %s", body)
 	}
 	if !strings.Contains(body, "clean answer") {
 		t.Fatalf("expected recovered answer, got %s", body)
+	}
+}
+
+// Issue #158: Kiro can finish an answer with usage events and clean EOF, without
+// metadataEvent. Neither usage events nor an explicit stop reason are required
+// for a content-bearing response to complete successfully on any public path.
+func TestContentCleanEOFCompletesAcrossAPIPaths(t *testing.T) {
+	const answer = "complete answer"
+	for _, api := range []struct {
+		name string
+		path string
+	}{
+		{"claude", "/v1/messages"},
+		{"openai", "/v1/chat/completions"},
+		{"responses", "/v1/responses"},
+	} {
+		for _, streaming := range []bool{false, true} {
+			for _, usageEvents := range []bool{false, true} {
+				name := api.name + "/nonstream/content_only"
+				if streaming {
+					name = api.name + "/stream/content_only"
+				}
+				if usageEvents {
+					name = strings.TrimSuffix(name, "content_only") + "content_context_metering"
+				}
+				t.Run(name, func(t *testing.T) {
+					var hits atomic.Int32
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						hits.Add(1)
+						w.WriteHeader(http.StatusOK)
+						_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+							"content": answer,
+						}))
+						if usageEvents {
+							_, _ = w.Write(awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{
+								"contextUsagePercentage": 12.5,
+							}))
+							_, _ = w.Write(awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{
+								"usage": 1.25,
+							}))
+						}
+						// No metadataEvent: returning ends the body at a frame boundary.
+					}))
+					defer server.Close()
+					h := setupIntegrityPathTest(t, server)
+					payload := map[string]interface{}{
+						"model": "claude-sonnet-4.5", "stream": streaming,
+						"max_tokens": 100,
+						"messages":   []map[string]string{{"role": "user", "content": "hello"}},
+					}
+					if api.name == "responses" {
+						delete(payload, "messages")
+						delete(payload, "max_tokens")
+						payload["input"] = "hello"
+						payload["store"] = false
+					}
+					requestBody, err := json.Marshal(payload)
+					if err != nil {
+						t.Fatal(err)
+					}
+					req := httptest.NewRequest(http.MethodPost, api.path, strings.NewReader(string(requestBody)))
+					rec := httptest.NewRecorder()
+					switch api.name {
+					case "claude":
+						h.handleClaudeMessages(rec, req)
+					case "openai":
+						h.handleOpenAIChat(rec, req)
+					case "responses":
+						h.handleOpenAIResponses(rec, req)
+					}
+					body := rec.Body.String()
+					if hits.Load() != 1 {
+						t.Fatalf("complete content must not retry, upstream hits=%d body=%s", hits.Load(), body)
+					}
+					if rec.Code != http.StatusOK || strings.Contains(body, `"error"`) || strings.Contains(body, "response.failed") {
+						t.Fatalf("expected successful answer, status=%d body=%s", rec.Code, body)
+					}
+					if !strings.Contains(body, answer) {
+						t.Fatalf("missing answer: %s", body)
+					}
+					if usageEvents && h.getCredits() != 1.25 {
+						t.Fatalf("expected metering to survive clean EOF, credits=%v", h.getCredits())
+					}
+					if streaming {
+						if !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/event-stream") {
+							t.Fatalf("expected SSE, got %q", rec.Header().Get("Content-Type"))
+						}
+						for _, line := range strings.Split(body, "\n") {
+							if strings.HasPrefix(line, "data: ") && line != "data: [DONE]" && !json.Valid([]byte(strings.TrimPrefix(line, "data: "))) {
+								t.Fatalf("invalid SSE JSON: %s", line)
+							}
+						}
+						var markers []string
+						switch api.name {
+						case "claude":
+							markers = []string{`"stop_reason":"end_turn"`, "event: message_stop"}
+						case "openai":
+							markers = []string{`"finish_reason":"stop"`, "data: [DONE]"}
+						case "responses":
+							markers = []string{"event: response.completed", `"status":"completed"`, "data: [DONE]"}
+						}
+						for _, marker := range markers {
+							if !strings.Contains(body, marker) {
+								t.Fatalf("missing completion marker %q: %s", marker, body)
+							}
+						}
+						return
+					}
+					switch api.name {
+					case "claude":
+						var resp ClaudeResponse
+						if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+							t.Fatal(err)
+						}
+						if resp.StopReason != "end_turn" || len(resp.Content) != 1 || resp.Content[0].Text != answer {
+							t.Fatalf("unexpected completed answer: %+v", resp)
+						}
+					case "openai":
+						var resp OpenAIResponse
+						if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+							t.Fatal(err)
+						}
+						if len(resp.Choices) != 1 || resp.Choices[0].FinishReason != "stop" || resp.Choices[0].Message.Content != answer {
+							t.Fatalf("unexpected completed answer: %+v", resp)
+						}
+					case "responses":
+						var resp ResponsesObject
+						if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+							t.Fatal(err)
+						}
+						if resp.Status != "completed" || len(resp.Output) != 1 || len(resp.Output[0].Content) != 1 || resp.Output[0].Content[0].Text != answer {
+							t.Fatalf("unexpected completed answer: %+v", resp)
+						}
+					}
+				})
+			}
+		}
 	}
 }

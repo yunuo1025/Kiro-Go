@@ -28,8 +28,8 @@ const maxAccountRetryAttempts = 3
 const maxSameAccountStreamRetries = 2
 
 // errUpstreamTruncatedResponse is a soft failure raised when a transport-clean
-// stream carried content but never a terminal signal. It is retryable on the
-// same account and must not mark the account unhealthy.
+// stream carried reasoning but no answer, tool call, or stop reason. It is
+// retryable on the same account and must not mark the account unhealthy.
 //
 // There is deliberately no empty-response error here. A stream that produced no
 // output at all is already caught one layer down: parseEventStreamTracked
@@ -41,32 +41,24 @@ const maxSameAccountStreamRetries = 2
 var errUpstreamTruncatedResponse = errors.New("upstream truncated response without stop reason")
 
 // classifyStreamIntegrity decides whether an upstream stream that returned no
-// transport error is actually complete. parseEventStream reports success on a
-// clean EOF, so a stream that died mid-answer is otherwise indistinguishable
-// from a finished one.
+// transport error is complete. A stopReason, delivered tool call, or answer
+// content counts as complete. Some upstream accounts never send metadataEvent
+// (which carries stopReason), so requiring it after content rejects every turn
+// on those accounts and wastes quota on retries. Accepting content on clean EOF
+// also means a mid-answer EOF without a transport error cannot be detected here.
 //
-// Complete when a stopReason arrived, or when a tool call was delivered. Both
-// match Kiro IDE, whose empty and truncation predicates each require
-// toolCallCount === 0.
-//
-// Truncated when content arrived without any terminal signal.
-//
-// Reasoning-only with no answer is STRICTER THAN THE IDE, deliberately. The
-// IDE's truncation predicate ends in (contentChars > 0 || !reasoningSeen), so
-// reasoning with no answer and no stopReason is treated as complete there and
-// is never retried. That is the exact shape of the production symptom this
-// proxy exists to fix: thinking streams in full, then the turn dies before the
-// answer or the tool call. Handing a client reasoning with no answer as a
-// successful turn is what made the failure invisible, so it is classified as
-// truncated here.
+// Reasoning-only with no answer remains stricter than Kiro IDE, deliberately.
+// Thinking may stream in full before the turn dies without an answer or tool
+// call; reporting that as success would hide the failure. A reasoning-only turn
+// therefore still needs a stopReason to count as complete.
 func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string, sawReasoning bool) error {
 	if strings.TrimSpace(stopReason) != "" {
 		return nil
 	}
-	if toolCallCount > 0 {
+	if toolCallCount > 0 || contentChars > 0 {
 		return nil
 	}
-	if contentChars > 0 || sawReasoning {
+	if sawReasoning {
 		return errUpstreamTruncatedResponse
 	}
 	// No content, no reasoning, no tools: unreachable through the wired paths
