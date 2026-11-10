@@ -1206,7 +1206,11 @@ func GetKiroClientConfig() KiroClientConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 
-	kiroVersion := "0.11.107"
+	// Kiro IDE version reported in the upstream User-Agent. Upstream rejects
+	// older builds with 403 FEATURE_NOT_SUPPORTED ("This version of Kiro is no
+	// longer supported"), so this must track a current IDE release. Override
+	// with "kiroVersion" in config.json when upstream raises the floor again.
+	kiroVersion := "1.4.121"
 	if cfg != nil && cfg.KiroVersion != "" {
 		kiroVersion = cfg.KiroVersion
 	}
